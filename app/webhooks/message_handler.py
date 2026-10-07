@@ -3,11 +3,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from sqlalchemy.orm.attributes import flag_modified
 
-from decimal import Decimal
 from datetime import datetime, timedelta
 import re
 
 from app.services.ai_engine import Intent
+from app.config import settings
+from app.services.conversation_history import log_outbound
 from app.services.whatsapp import whatsapp_service
 from app.models import User, Event, Booking, Ticket, Conversation
 from app.services.location import format_distance
@@ -774,9 +775,11 @@ async def handle_greeting(entities: Dict, phone: str, db: AsyncSession):
     
     import random
     response = random.choice(greeting_responses)
-    
+
     await whatsapp_service.send_message(phone, response)
-    
+    # Record this assistant turn so the LLM has it as conversation memory.
+    await log_outbound(phone, response, db, intent="greeting")
+
     # Don't immediately send menu - let conversation continue naturally
     # User can ask for menu or just tell us what they want
 
@@ -994,94 +997,130 @@ async def handle_unlock_secret_event(entities: Dict, phone: str, db: AsyncSessio
     await _send_event_details(event, phone, db, conversation)
 
 
+async def _release_reservation(booking_id, db: AsyncSession):
+    """Undo a pending reservation (restore the ticket count) if checkout can't start."""
+    try:
+        result = await db.execute(select(Booking).where(Booking.id == booking_id))
+        booking = result.scalar_one_or_none()
+        if not booking or booking.status != 'pending':
+            return
+        result = await db.execute(select(Event).where(Event.id == booking.event_id))
+        event = result.scalar_one_or_none()
+        if event:
+            event.tickets_sold = max((event.tickets_sold or 0) - booking.quantity, 0)
+        booking.status = 'expired'
+        await db.commit()
+    except Exception as e:
+        print(f"Failed to release reservation {booking_id}: {e}")
+        await db.rollback()
+
+
 async def handle_booking_intent(entities: Dict, phone: str, db: AsyncSession):
-    """Handle booking intent - instant booking (no payment gateway)"""
-    from app.services.bookings import instant_book
+    """Handle booking intent — reserve tickets and send a Paystack payment link.
+
+    Tickets are only confirmed once Paystack reports a successful charge (see the
+    /webhooks/paystack handler -> confirm_payment). Here we create a pending
+    booking (which reserves the tickets for 15 minutes) and hand the user a
+    secure checkout link.
+    """
+    from app.services.bookings import create_booking, initiate_payment
     from app.models import Conversation
     from app.services.user_registration import check_user_registration_status, UserRegistrationFlow
-    
+
     # Check if user is registered
     status = await check_user_registration_status(phone, db)
-    
+
     if not status['registered'] or not status['profile_complete']:
-        # Start registration flow
         await whatsapp_service.send_message(
             phone,
             "To book tickets, finish setup first."
         )
         await UserRegistrationFlow.start_flow(phone, db)
         return
-    
+
     # Get conversation state
     result = await db.execute(
         select(Conversation).where(Conversation.phone == phone)
     )
     conversation = result.scalar_one_or_none()
-    
+
     if not conversation or not conversation.flow_state:
-        message = (
-            "Pick an event first.\n"
-            "Try: Concerts in Lagos or Events this weekend."
+        await whatsapp_service.send_message(
+            phone,
+            "Pick an event first.\nTry: Concerts in Lagos or Events this weekend."
         )
-        await whatsapp_service.send_message(phone, message)
         await send_back_to_menu(phone, db)
         return
-    
+
     # Check if event is selected
     event_id = conversation.flow_state.get('selected_event_id')
     if not event_id:
-        message = "Pick an event from your list."
-        await whatsapp_service.send_message(phone, message)
+        await whatsapp_service.send_message(phone, "Pick an event from your list.")
         await send_back_to_menu(phone, db)
         return
-    
-    # Get quantity
-    quantity = entities.get('quantity', 1)
-    
-    # Get user (we know they exist from check above)
-    user = status['user']
-    
+
+    quantity = max(int(entities.get('quantity', 1) or 1), 1)
+    user = status['user']  # we know they exist from the check above
+
+    # Payments must be configured before we can take real money.
+    if not settings.FLUTTERWAVE_SECRET_KEY:
+        await whatsapp_service.send_message(
+            phone,
+            "Payments are temporarily unavailable. Please try again shortly."
+        )
+        await send_back_to_menu(phone, db)
+        return
+
+    # Reserve the tickets with a pending booking. Unpaid reservations are
+    # released after 15 minutes by the cleanup_expired_bookings Celery task.
     try:
-        # Use instant booking (no payment required)
-        booking_result = await instant_book(
+        booking = await create_booking(
             user_id=str(user.id),
             event_id=event_id,
             phone=phone,
             quantity=quantity,
             db=db
         )
-        
-        if booking_result['success']:
-            event = booking_result['event']
-            message = (
-                f"✅ Booking confirmed!\n\n"
-                f"Event: {event.title}\n"
-                f"Date: {event.event_date.strftime('%a, %b %d at %I:%M %p')}\n"
-                f"Tickets: {quantity}\n"
-                f"Total: NGN {booking_result['total_amount']:,.0f}\n\n"
-                f"Your tickets are ready. Check 'My Tickets' to view them."
-            )
-            await whatsapp_service.send_message(phone, message)
-            
-            # Update conversation state
-            conversation.flow_state = {}
-            flag_modified(conversation, 'flow_state')
-            await db.commit()
-        else:
-            await whatsapp_service.send_message(phone, booking_result['message'])
-        
-        await send_back_to_menu(phone, db)
-        
     except ValueError as e:
         await whatsapp_service.send_message(phone, f"❌ {str(e)}")
         await send_back_to_menu(phone, db)
+        return
     except Exception as e:
         print(f"Booking error: {e}")
+        await whatsapp_service.send_message(phone, "❌ Something went wrong. Please try again.")
+        await send_back_to_menu(phone, db)
+        return
+
+    # Open a Paystack checkout (hosted page lets the user pick card/bank/USSD).
+    try:
+        payment = await initiate_payment(str(booking.id), 'all', db)
+    except Exception as e:
+        print(f"Payment init error: {e}")
+        await _release_reservation(booking.id, db)
         await whatsapp_service.send_message(
             phone,
-            "❌ Something went wrong. Please try again."
+            "❌ Couldn't start payment just now. Please try again."
         )
         await send_back_to_menu(phone, db)
+        return
+
+    # Remember the pending booking for this chat.
+    conversation.flow_state['pending_booking_id'] = str(booking.id)
+    flag_modified(conversation, 'flow_state')
+    await db.commit()
+
+    result = await db.execute(select(Event).where(Event.id == event_id))
+    event = result.scalar_one()
+
+    message = (
+        f"Almost there! Secure your {quantity} ticket(s) for {event.title}.\n\n"
+        f"Total: NGN {booking.total_amount:,.0f}\n\n"
+        f"Pay securely here:\n{payment['payment_url']}\n\n"
+        "Your tickets arrive here automatically once payment is confirmed. "
+        "This link expires in 15 minutes."
+    )
+    await whatsapp_service.send_message(phone, message)
+    await send_back_to_menu(phone, db)
 
 
 async def handle_view_tickets(entities: Dict, phone: str, db: AsyncSession):
@@ -1155,63 +1194,62 @@ async def handle_general_query(entities: Dict, phone: str, db: AsyncSession):
         conversation=None,
         context="general_quick_actions"
     )
+    # Record this assistant turn so the LLM has it as conversation memory.
+    await log_outbound(phone, message, db, intent="general_query")
 
 
 async def handle_payment_method_selection(button_id: str, phone: str, db: AsyncSession):
-    """Handle payment method button clicks"""
+    """Handle payment method button clicks — send a real Paystack checkout link."""
     from app.services.bookings import initiate_payment
-    
-    # Parse button_id: pay_card_<booking_id>
+
+    # Parse button_id: pay_<method>_<booking_id>
     parts = button_id.split('_')
     if len(parts) < 3:
         return
-    
+
     payment_method = parts[1]  # card, bank, ussd
     booking_id = parts[2]
-    
+
+    # Payments must be configured to take real money.
+    if not settings.FLUTTERWAVE_SECRET_KEY:
+        await whatsapp_service.send_message(
+            phone,
+            "Payments are temporarily unavailable. Please try again shortly."
+        )
+        await send_back_to_menu(phone, db)
+        return
+
     try:
-        # BYPASS PAYMENT FOR TESTING
-        from app.services.test_utils import bypass_payment
-        success = await bypass_payment(booking_id, db)
-        
-        if success:
-            # We don't need to send the payment link if it's already confirmed
-            return
-            
-        # Fallback to normal payment if bypass fails (shouldn't happen in test)
-        from app.services.bookings import initiate_payment
         payment_data = await initiate_payment(booking_id, payment_method, db)
-        
-        # Get booking
+
+        # Get booking for the amount
         result = await db.execute(
             select(Booking).where(Booking.id == booking_id)
         )
         booking = result.scalar_one()
-        
-        # Send payment link
+
         method_names = {
             'card': 'Card',
             'bank': 'Bank Transfer',
             'ussd': 'USSD'
         }
-        
-        message = f"{method_names.get(payment_method, 'Payment')}\n\n"
-        message += f"Amount: NGN {booking.total_amount:,.0f}\n"
-        message += f"Processing fee: NGN {int(booking.total_amount * 0.015):,.0f}\n"
-        total_with_fee = booking.total_amount + (booking.total_amount * Decimal('0.015'))
-        message += f"Total: NGN {total_with_fee:,.0f}\n\n"
-        message += "Pay with this link:\n"
-        message += f"{payment_data['payment_url']}\n\n"
-        message += "Link expires in 15 minutes."
-        
+        message = (
+            f"{method_names.get(payment_method, 'Payment')}\n\n"
+            f"Amount: NGN {booking.total_amount:,.0f}\n\n"
+            f"Pay securely here:\n{payment_data['payment_url']}\n\n"
+            "Your tickets arrive here automatically once payment is confirmed.\n"
+            "This link expires in 15 minutes."
+        )
         await whatsapp_service.send_message(phone, message)
         await send_back_to_menu(phone, db)
-        
+
     except Exception as e:
+        print(f"Payment init error: {e}")
         await whatsapp_service.send_message(
             phone,
             "Payment initialization failed. Please try again."
         )
+        await send_back_to_menu(phone, db)
 
 
 async def handle_create_event(entities: Dict, phone: str, db: AsyncSession):

@@ -21,11 +21,25 @@ class Settings(BaseSettings):
     # AI
     GROQ_API_KEY: str
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    # Classification should be deterministic — keep temperature at 0 unless tuning.
+    GROQ_TEMPERATURE: float = 0.0
+    GROQ_MAX_TOKENS: int = 700
+    # Hard ceiling on a single Groq call (seconds) so a slow LLM never hangs a webhook.
+    GROQ_TIMEOUT_SECONDS: float = 15.0
+    # Transient-failure retries handled by the Groq SDK.
+    GROQ_MAX_RETRIES: int = 2
+    # Multi-turn memory: how many prior messages to replay to the model, and a
+    # safety cap on total characters so the prompt can't grow without bound.
+    AI_HISTORY_TURNS: int = 10
+    AI_HISTORY_MAX_CHARS: int = 4000
 
-    # Payments (Optional — system uses bypass mode when missing)
-    PAYSTACK_SECRET_KEY: Optional[str] = ""
-    PAYSTACK_PUBLIC_KEY: Optional[str] = ""
-    PAYSTACK_API_URL: str = "https://api.paystack.co"
+    # Payments (Optional — system degrades gracefully when missing)
+    FLUTTERWAVE_SECRET_KEY: Optional[str] = ""
+    FLUTTERWAVE_PUBLIC_KEY: Optional[str] = ""
+    # Secret hash you set in the Flutterwave dashboard (Settings > Webhooks).
+    # Sent back on every webhook in the `verif-hash` header for verification.
+    FLUTTERWAVE_VERIF_HASH: Optional[str] = ""
+    FLUTTERWAVE_API_URL: str = "https://api.flutterwave.com/v3"
 
     # Storage (Optional — falls back to placeholder QR URLs when missing)
     CLOUDINARY_CLOUD_NAME: Optional[str] = ""

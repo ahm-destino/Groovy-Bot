@@ -10,6 +10,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from datetime import datetime
 import re
 
+from app.config import settings
 from app.models import User, Conversation
 from app.services.whatsapp import whatsapp_service
 from app.services.menu import send_main_menu, send_back_to_menu
@@ -241,16 +242,18 @@ class UserRegistrationFlow:
             )
             return
 
-        # Check if email already exists
+        # Look up an existing account by this email. The users table is shared
+        # with the Grooovy webapp, so the email may already belong to a real
+        # account (e.g. a webapp signup). Per product decision we link & load it
+        # onto this WhatsApp number instead of rejecting it as a duplicate.
         result = await db.execute(
             select(User).where(User.email == email_input)
         )
         existing_user = result.scalar_one_or_none()
 
         if existing_user:
-            await whatsapp_service.send_message(
-                phone,
-                "❌ That email is already registered. Please send a different one."
+            await UserRegistrationFlow._link_existing_account(
+                phone, existing_user, conversation, db
             )
             return
 
@@ -271,6 +274,64 @@ class UserRegistrationFlow:
             "3. Send your current location"
         )
         await whatsapp_service.send_message(phone, message)
+
+    @staticmethod
+    async def _link_existing_account(
+        phone: str,
+        existing_user: User,
+        conversation: Conversation,
+        db: AsyncSession
+    ):
+        """Attach this WhatsApp number to an existing account and load its data.
+
+        Implements the "always link & load" behaviour: when the entered email
+        already has an account, we claim it for this phone (moving the number
+        off any stub row created earlier in this chat) and finish signup using
+        the account's saved profile, filling only missing fields with what was
+        just typed.
+        """
+        # A stub user may already hold this phone (created when we captured the
+        # WhatsApp display name or a shared location). Free the unique phone
+        # value from it before moving the number onto the real account.
+        result = await db.execute(
+            select(User).where(User.phone == phone)
+        )
+        stub = result.scalar_one_or_none()
+        if stub is not None and stub.id != existing_user.id:
+            if not existing_user.whatsapp_name and stub.whatsapp_name:
+                existing_user.whatsapp_name = stub.whatsapp_name
+            stub.phone = None
+            await db.flush()  # release the unique phone before reassigning it
+
+        existing_user.phone = phone
+
+        # "Load their data": keep the account's existing name; only fill blanks
+        # from the name just collected so the profile reads as complete (else the
+        # user would be bounced back into registration on their next message).
+        flow_state = conversation.flow_state or {}
+        collected_first = flow_state.get('first_name')
+        collected_last = flow_state.get('last_name')
+        if not existing_user.first_name and collected_first:
+            existing_user.first_name = collected_first
+        if not existing_user.last_name and collected_last:
+            existing_user.last_name = collected_last
+
+        # Finish the flow — the account already exists, so skip remaining steps.
+        conversation.current_flow = None
+        conversation.flow_state = {}
+        flag_modified(conversation, 'flow_state')
+        await db.commit()
+        await db.refresh(existing_user)
+
+        display_name = existing_user.first_name or existing_user.whatsapp_name or "there"
+        await whatsapp_service.send_message(
+            phone,
+            f"✅ Welcome back, {display_name}! I found your Grooovy account for "
+            f"{existing_user.email} and linked it to this WhatsApp number — your "
+            "profile and tickets are all here."
+        )
+        await send_main_menu(phone, db)
+        print(f"Linked existing account {existing_user.email} to phone {phone}")
 
     @staticmethod
     async def _handle_location(
@@ -298,8 +359,7 @@ class UserRegistrationFlow:
     async def complete_registration(phone: str, db: AsyncSession, conversation: Conversation):
         """Create or update user account and finish flow"""
         import asyncio
-        from app.services.test_utils import create_mock_event_near_user
-        
+
         first_name = conversation.flow_state.get('first_name')
         last_name = conversation.flow_state.get('last_name')
         email = conversation.flow_state.get('email')
@@ -338,21 +398,22 @@ class UserRegistrationFlow:
         await send_main_menu(phone, db)
         print(f"New user registered: {first_name} {last_name} ({phone})")
         
-        # Create mock events after registration (5 minutes delay)
-        # Run in background - create simple events near user's location
-        if location:
+        # Testing aid only: pre-populate nearby mock events after signup. Gated
+        # behind ENABLE_MOCK_EVENTS so production users never get fabricated events.
+        if settings.ENABLE_MOCK_EVENTS and location:
             try:
+                from app.services.test_utils import create_mock_event_near_user
                 # Extract coordinates from location (format: "latitude,longitude" or similar)
                 # For testing, use Lagos coordinates
                 lat, lng = 6.613739, 3.355257  # Default Lagos area
-                
+
                 # Create 5 mock events
                 asyncio.create_task(create_mock_event_near_user(phone, 1, lat, lng))
                 asyncio.create_task(create_mock_event_near_user(phone, 3, lat, lng))
                 asyncio.create_task(create_mock_event_near_user(phone, 5, lat, lng))
                 asyncio.create_task(create_mock_event_near_user(phone, 7, lat, lng))
                 asyncio.create_task(create_mock_event_near_user(phone, 10, lat, lng))
-                
+
                 print(f"Mock events queued for creation: {phone}")
             except Exception as e:
                 print(f"Failed to create mock events: {e}")

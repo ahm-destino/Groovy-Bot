@@ -31,3 +31,17 @@ class User(Base):
     location_preference = Column(Geography(geometry_type='POINT', srid=4326))
     preferred_categories = Column(ARRAY(String))
     language = Column(String(10), default='en')
+
+    @property
+    def name(self) -> "str | None":
+        """
+        Human-friendly display name.
+
+        The model stores names as first_name/last_name (shared with the webapp),
+        but several call sites expect a single `name` attribute. Compose it here
+        so those paths render a real name instead of raising AttributeError.
+        """
+        parts = [p for p in (self.first_name, self.last_name) if p]
+        if parts:
+            return " ".join(parts)
+        return self.whatsapp_name or None

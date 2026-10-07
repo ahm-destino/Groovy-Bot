@@ -28,7 +28,7 @@ class Booking(Base):
 
     # Bot-specific fields
     phone = Column(String(20))  # WhatsApp phone number
-    payment_reference = Column(String(100), unique=True, index=True)  # Paystack reference
+    payment_reference = Column(String(100), unique=True, index=True)  # Flutterwave tx_ref
     payment_method = Column(String(50))  # card, bank, ussd, mobile_money
     booked_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
     confirmed_at = Column(TIMESTAMP(timezone=True))

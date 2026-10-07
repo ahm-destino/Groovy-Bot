@@ -1,10 +1,11 @@
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, update, func
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 from app.models import Booking, Event, User
-from app.services.payments import paystack_service
+from app.services.payments import flutterwave_service
 from app.services.tickets import generate_tickets_for_booking
 from app.services.whatsapp import whatsapp_service
 from app.services.menu import send_back_to_menu
@@ -18,16 +19,34 @@ async def create_booking(
     db: AsyncSession
 ) -> Booking:
     """
-    Create a new booking (reserves tickets for 15 minutes)
-    """
-    result = await db.execute(
-        select(Event).where(Event.id == event_id)
-    )
-    event = result.scalar_one()
+    Create a new booking (reserves tickets for 15 minutes).
 
-    available = event.capacity - (event.tickets_sold or 0)
-    if available < quantity:
-        raise ValueError(f"Only {available} tickets available")
+    Reservation is a single conditional UPDATE, so the capacity check and the
+    increment happen atomically inside the database. Two buyers racing for the
+    last seat can no longer both pass the check and oversell the event.
+    """
+    if quantity < 1:
+        raise ValueError("Quantity must be at least 1")
+
+    event = (await db.execute(
+        select(Event).where(Event.id == event_id)
+    )).scalar_one()
+
+    # Atomic reserve: only updates while enough capacity remains. If no row
+    # matches, the event is sold out for this quantity.
+    reserve = await db.execute(
+        update(Event)
+        .where(
+            Event.id == event_id,
+            func.coalesce(Event.tickets_sold, 0) + quantity <= Event.capacity
+        )
+        .values(tickets_sold=func.coalesce(Event.tickets_sold, 0) + quantity)
+    )
+
+    if reserve.rowcount == 0:
+        await db.rollback()
+        remaining = event.capacity - (event.tickets_sold or 0)
+        raise ValueError(f"Only {max(remaining, 0)} tickets available")
 
     total_amount = event.ticket_price * quantity
 
@@ -44,9 +63,6 @@ async def create_booking(
     db.add(booking)
     await db.commit()
     await db.refresh(booking)
-
-    event.tickets_sold = (event.tickets_sold or 0) + quantity
-    await db.commit()
 
     return booking
 
@@ -79,7 +95,7 @@ async def initiate_payment(
     }
     channels = channels_map.get(payment_method, ['card', 'bank', 'ussd', 'mobile_money'])
 
-    payment_data = await paystack_service.initialize_transaction(
+    payment_data = await flutterwave_service.initialize_transaction(
         email=user.email or f"{booking.phone}@grooovy.app",
         amount=booking.total_amount,
         reference=reference,
@@ -164,11 +180,15 @@ async def confirm_payment(
     db: AsyncSession
 ) -> dict:
     """
-    Confirm payment and generate tickets
-    """
-    payment_data = await paystack_service.verify_transaction(reference)
+    Confirm payment and generate tickets.
 
-    if payment_data['status'] != 'success':
+    Safe to call more than once for the same reference: Paystack retries its
+    webhook, so an already-confirmed booking is returned without re-issuing
+    tickets or re-sending the confirmation.
+    """
+    payment_data = await flutterwave_service.verify_transaction(reference)
+
+    if payment_data.get('status') != 'success':
         return {
             'success': False,
             'message': 'Payment not successful',
@@ -179,7 +199,39 @@ async def confirm_payment(
     result = await db.execute(
         select(Booking).where(Booking.payment_reference == reference)
     )
-    booking = result.scalar_one()
+    booking = result.scalar_one_or_none()
+
+    if booking is None:
+        return {
+            'success': False,
+            'message': 'Booking not found for reference',
+            'booking': None,
+            'tickets': []
+        }
+
+    # Idempotency: don't double-confirm or re-issue tickets on webhook retries.
+    if booking.status == 'confirmed':
+        return {
+            'success': True,
+            'booking': booking,
+            'tickets': [],
+            'already_confirmed': True
+        }
+
+    # Guard against underpayment / tampering. Flutterwave amounts are in whole
+    # Naira (verify_transaction returns them as a Decimal), so compare directly.
+    paid_amount = payment_data.get('amount')
+    if paid_amount is not None:
+        try:
+            if Decimal(str(paid_amount)) < booking.total_amount - Decimal('0.01'):
+                return {
+                    'success': False,
+                    'message': 'Amount paid does not match booking total',
+                    'booking': booking,
+                    'tickets': []
+                }
+        except (InvalidOperation, TypeError, ValueError):
+            pass
 
     booking.status = 'confirmed'
     booking.confirmed_at = datetime.now()
@@ -270,7 +322,7 @@ async def cancel_booking(
         }
 
     try:
-        await paystack_service.initiate_refund(
+        await flutterwave_service.initiate_refund(
             transaction_reference=booking.payment_reference,
             reason=reason
         )

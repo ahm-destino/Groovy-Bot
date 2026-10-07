@@ -11,7 +11,7 @@ from decimal import Decimal
 
 from app.models import Booking, Ticket, Event, User, Conversation
 from app.services.whatsapp import whatsapp_service
-from app.services.payments import paystack_service
+from app.services.payments import flutterwave_service
 from app.services.interaction_tracking import record_interaction_sent
 from app.services.menu import send_back_to_menu
 

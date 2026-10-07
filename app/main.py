@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import json
 import asyncio
+import logging
 
 from sqlalchemy import select
 from geoalchemy2.elements import WKTElement
@@ -19,8 +20,44 @@ from app.services.user_registration import UserRegistrationFlow, get_or_create_u
 from app.services.location import get_events_near_location
 from app.services.locks import inbound_phone_lock
 from app.services.menu import send_main_menu
+from app.services.conversation_history import get_recent_history, log_outbound
 
 app = FastAPI(title="Grooovy WhatsApp Bot")
+
+logger = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+async def validate_production_config():
+    """Warn (never crash) if a production deploy is missing optional configuration.
+
+    GROQ_API_KEY and DATABASE_URL are already enforced by pydantic (no default),
+    so those must be present for the app to import at all. Everything checked
+    here is optional: a missing payment key or app secret degrades a feature, it
+    must not stop the bot from booting and serving the flows that still work.
+    The only hard failure is an insecure default SECRET_KEY, which is a genuine
+    security hole rather than a missing optional feature.
+    """
+    if settings.APP_ENV != "production":
+        return
+
+    if not settings.WHATSAPP_APP_SECRET:
+        logger.warning(
+            "WHATSAPP_APP_SECRET is not set — falling back to the access token "
+            "for webhook signature verification. Set it before going live."
+        )
+    if not settings.FLUTTERWAVE_SECRET_KEY:
+        logger.warning(
+            "FLUTTERWAVE_SECRET_KEY is not set — the bot will run, but booking will "
+            "reply that payments are unavailable until a key is configured."
+        )
+    if settings.ENABLE_MOCK_EVENTS:
+        logger.warning("ENABLE_MOCK_EVENTS is ON in production — fake events will be created.")
+
+    if settings.SECRET_KEY == "change-me-in-production":
+        message = "SECRET_KEY is still the insecure default — set a real secret before going live."
+        logger.error(message)
+        raise RuntimeError(message)
 
 
 async def create_mock_event_and_notify(phone: str, delay_seconds: int, lat: float, lng: float, db: AsyncSession):
@@ -31,14 +68,11 @@ async def create_mock_event_and_notify(phone: str, delay_seconds: int, lat: floa
     try:
         # Wait for the specified delay
         await asyncio.sleep(delay_seconds)
-        
-        # Create new session for this async task
-        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession as AsyncSessionNew
-        from sqlalchemy.orm import sessionmaker
-        
-        engine = create_async_engine(settings.DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://"))
-        AsyncSessionLocal = sessionmaker(engine, class_=AsyncSessionNew, expire_on_delete=False)
-        
+
+        # Use the shared, correctly-configured session factory for this
+        # background task (the request-scoped `db` is closed by now).
+        from app.database import AsyncSessionLocal
+
         async with AsyncSessionLocal() as task_db:
             event = Event(
                 title="🎉 Stefan's Exclusive Flash Event - JUST FOR YOU!",
@@ -165,46 +199,43 @@ async def receive_webhook(
     return {"status": "ok"}
 
 
-@app.post("/webhooks/paystack")
-async def paystack_webhook(
+@app.post("/webhooks/flutterwave")
+async def flutterwave_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db)
 ):
-    """Handle Paystack payment webhooks"""
-    import hmac
-    import hashlib
-    
-    body = await request.body()
-    signature = request.headers.get("x-paystack-signature", "")
+    """Handle Flutterwave payment webhooks.
 
-    # Verify signature — Paystack signs with PAYSTACK_SECRET_KEY using SHA-512
-    expected_signature = hmac.new(
-        settings.PAYSTACK_SECRET_KEY.encode(),
-        body,
-        hashlib.sha512
-    ).hexdigest()
-    
-    if not hmac.compare_digest(signature, expected_signature):
+    Flutterwave sends the secret hash you configured in the dashboard back in the
+    `verif-hash` header on every request, so we compare it to FLUTTERWAVE_VERIF_HASH.
+    """
+    verif_hash = request.headers.get("verif-hash", "")
+
+    if not verif_hash or not settings.FLUTTERWAVE_VERIF_HASH or \
+            not hmac.compare_digest(verif_hash, settings.FLUTTERWAVE_VERIF_HASH):
         raise HTTPException(status_code=403, detail="Invalid signature")
-    
+
     # Parse event
     event_data = await request.json()
     event_type = event_data.get("event")
-    
-    if event_type == "charge.success":
-        # Payment successful
-        from app.services.bookings import confirm_payment
-        
-        reference = event_data["data"]["reference"]
-        
-        try:
-            result = await confirm_payment(reference, db)
-            if result['success']:
-                return {"status": "success", "message": "Payment confirmed"}
-        except Exception as e:
-            print(f"Payment confirmation error: {e}")
-            return {"status": "error", "message": str(e)}
-    
+
+    if event_type == "charge.completed":
+        data = event_data.get("data", {})
+        if data.get("status") == "successful":
+            # Payment successful
+            from app.services.bookings import confirm_payment
+
+            reference = data.get("tx_ref")
+
+            try:
+                result = await confirm_payment(reference, db)
+                if result['success']:
+                    return {"status": "success", "message": "Payment confirmed"}
+                return {"status": "ok", "message": result.get('message', 'ignored')}
+            except Exception as e:
+                print(f"Payment confirmation error: {e}")
+                return {"status": "error", "message": str(e)}
+
     return {"status": "ok"}
 
 
@@ -348,13 +379,14 @@ async def _process_incoming_message_locked(
                 phone,
                 "📍 Location saved!"
             )
-            
-            # Schedule mock event creation after 5 minutes (silently for testing)
-            # Don't tell user about this - it's for internal testing
-            asyncio.create_task(
-                create_mock_event_and_notify(phone, 300, lat, lng, db)  # 300 seconds = 5 minutes
-            )
-            
+
+            # Testing aid only: spawn a mock "flash event" shortly after signup.
+            # Gated so production users never receive fabricated events.
+            if settings.ENABLE_MOCK_EVENTS:
+                asyncio.create_task(
+                    create_mock_event_and_notify(phone, 300, lat, lng, db)  # 300 seconds = 5 minutes
+                )
+
             # Show main menu without mentioning the mock event
             await send_main_menu(phone, db)
             return
@@ -465,14 +497,22 @@ async def _process_incoming_message_locked(
             # Fast path - no LLM needed
             await handle_intent(quick_intent, {"raw_message": user_message}, phone, db)
         else:
-            # LLM path - classify intent
-            ai_response = await classify_intent(
-                user_message,
-                conversation.flow_state or {}
+            # LLM path - classify intent with recent conversation as context.
+            # History is reconstructed from message_logs as real chat turns so
+            # the model has multi-turn memory. (Previously flow_state was passed
+            # here by mistake, which gave the model no memory and raised when the
+            # flow_state dict was non-empty.)
+            history = await get_recent_history(
+                phone,
+                db,
+                limit=settings.AI_HISTORY_TURNS,
+                max_chars=settings.AI_HISTORY_MAX_CHARS,
+                exclude_message_id=message_id,
             )
-            
+            ai_response = await classify_intent(user_message, history)
+
             # Update message log with intent (convert entities to JSON-safe dict)
-            message_log.intent_detected = ai_response.intent
+            message_log.intent_detected = ai_response.intent.value
             # Ensure all values are JSON serializable
             entities_dict = ai_response.entities.dict()
             # Convert any non-serializable types
