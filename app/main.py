@@ -158,20 +158,21 @@ async def receive_webhook(
     db: AsyncSession = Depends(get_db)
 ):
     """Receive incoming WhatsApp messages"""
-    body = await request.json()
-    # Avoid logging full webhook payloads to reduce risk of leaking user content.
-    
-    # Validate signature (important for security)
+    # Read raw bytes FIRST — signature must be verified against the original
+    # wire bytes, not a re-serialised dict (key order may differ and break HMAC).
+    raw_body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
-    if not verify_whatsapp_signature(body, signature):
+    if not verify_whatsapp_signature(raw_body, signature):
         raise HTTPException(status_code=403, detail="Invalid signature")
-    
+
+    body = json.loads(raw_body)
+
     # Process webhook
     if body.get("object") == "whatsapp_business_account":
         for entry in body.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
-                
+
                 # Handle incoming message
                 if "messages" in value:
                     metadata = value.get("metadata", {})
@@ -195,7 +196,7 @@ async def receive_webhook(
                             logging.error(f"Error processing message: {e}", exc_info=True)
                             # Try to rollback any failed transaction
                             await db.rollback()
-    
+
     return {"status": "ok"}
 
 
@@ -239,8 +240,13 @@ async def flutterwave_webhook(
     return {"status": "ok"}
 
 
-def verify_whatsapp_signature(payload: dict, signature: str) -> bool:
-    """Verify Meta's webhook signature using the App Secret"""
+def verify_whatsapp_signature(raw_body: bytes, signature: str) -> bool:
+    """Verify Meta's webhook signature using the App Secret.
+
+    Must receive the raw request bytes — hashing a re-serialised dict
+    causes HMAC mismatches because json.dumps key order may differ from
+    what Meta signed, turning every retry into a spurious 403.
+    """
     if settings.APP_ENV == "development":
         return True  # Skip verification in dev
 
@@ -251,7 +257,7 @@ def verify_whatsapp_signature(payload: dict, signature: str) -> bool:
     app_secret = getattr(settings, 'WHATSAPP_APP_SECRET', None) or settings.WHATSAPP_ACCESS_TOKEN
     expected_signature = hmac.new(
         app_secret.encode(),
-        json.dumps(payload, separators=(',', ':')).encode(),
+        raw_body,
         hashlib.sha256
     ).hexdigest()
 
@@ -306,6 +312,13 @@ async def _process_incoming_message_locked(
     phone = message["from"]
     message_id = message["id"]
     message_type = message["type"]
+
+    # Mark as read immediately — before any processing — so WhatsApp stops
+    # retrying and the user sees double-ticks right away.
+    try:
+        await whatsapp_service.mark_as_read(message_id)
+    except Exception:
+        pass  # Non-critical; processing continues regardless
 
     # De-duplicate inbound deliveries (Meta can retry the same message)
     if message_id:
@@ -428,11 +441,7 @@ async def _process_incoming_message_locked(
     db.add(message_log)
     await db.commit()
     
-    # Mark as read
-    try:
-        await whatsapp_service.mark_as_read(message_id)
-    except:
-        pass  # Non-critical
+    # mark_as_read is already called at the top of this function
     
     # Get or create conversation context
     result = await db.execute(
