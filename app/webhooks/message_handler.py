@@ -385,6 +385,32 @@ async def handle_intent(
     # Track clicks on last interactive
     await _track_interaction_click(db, conversation, raw_message)
 
+    # Navigation must win over an in-progress form.  This check intentionally
+    # happens before registration and active-flow handling: otherwise a text
+    # "Back to menu" can be consumed as an answer to the current form field.
+    reset_phrases = (
+        "restart", "reset", "start over", "start again", "start afresh",
+        "start fresh", "start new",
+    )
+    is_menu_command = raw_message == "action:menu" or raw_lower in (
+        "menu", "main menu", "back to menu", "home", "back",
+    )
+    is_reset_command = any(phrase in raw_lower for phrase in reset_phrases)
+    if is_menu_command or is_reset_command:
+        was_in_flow = bool(conversation.current_flow)
+        conversation.current_flow = None
+        conversation.flow_state = {}
+        flag_modified(conversation, "flow_state")
+        await db.commit()
+
+        if is_reset_command and was_in_flow:
+            await whatsapp_service.send_message(
+                phone,
+                "No problem — I discarded the current setup."
+            )
+        await send_main_menu(phone, db)
+        return
+
     # ============ STEP 1: CHECK IF USER IS REGISTERED ============
     # If user doesn't exist OR not fully registered → Go to registration
     if not user or not user.first_name or not user.last_name:
@@ -410,7 +436,14 @@ async def handle_intent(
     if conversation and conversation.current_flow in ('user_registration', 'gift_ticket', 'event_creation', 'event_editing'):
         from app.services.flow_interceptor import should_intercept_flow, handle_flow_intercept
         if should_intercept_flow(raw_message, conversation.current_flow, conversation.flow_state or {}):
-            await handle_flow_intercept(phone, raw_message, conversation.current_flow, conversation.flow_state or {}, db)
+            ai_response = await handle_flow_intercept(
+                phone, raw_message, conversation.current_flow,
+                conversation.flow_state or {}, db, send_response=False
+            )
+            await _handle_flow_side_request(
+                ai_response, phone, conversation.current_flow,
+                conversation.flow_state or {}, db
+            )
             return
     
     if conversation.current_flow == 'user_registration':
@@ -756,6 +789,7 @@ async def handle_intent(
         Intent.SHARE_TICKET: handle_share_ticket,
         Intent.REQUEST_REFUND: handle_request_refund,
         Intent.MANAGE_EVENT: handle_manage_event,
+        Intent.VIEW_BALANCE: handle_balance,
         Intent.CREATE_EVENT: handle_create_event,
         Intent.GREETING: handle_greeting,
         Intent.HELP: handle_help,
@@ -763,6 +797,37 @@ async def handle_intent(
     
     handler = handlers.get(intent, handle_general_query)
     await handler(entities, phone, db)
+
+
+async def _handle_flow_side_request(ai_response, phone: str, current_flow: str,
+                                    flow_state: dict, db: AsyncSession) -> None:
+    """Execute an explicit request without throwing away the user's draft."""
+    entities = ai_response.entities.dict()
+    entities['ai_message'] = ai_response.user_message
+
+    handlers = {
+        Intent.DISCOVER_EVENTS: handle_discover_events,
+        Intent.VIEW_MY_TICKETS: handle_view_tickets,
+        Intent.MANAGE_EVENT: handle_manage_event,
+        Intent.VIEW_BALANCE: handle_balance,
+        Intent.REQUEST_REFUND: handle_request_refund,
+        Intent.SHARE_TICKET: handle_share_ticket,
+    }
+    handler = handlers.get(ai_response.intent)
+    if handler:
+        await handler(entities, phone, db)
+        from app.services.flow_interceptor import get_step_reminder
+        await whatsapp_service.send_message(
+            phone,
+            f"Your event draft is still saved. {get_step_reminder(current_flow, flow_state)}"
+        )
+        return
+
+    from app.services.flow_interceptor import get_step_reminder
+    reply = _safe_ai_message(ai_response.user_message) or "I can help with that."
+    await whatsapp_service.send_message(
+        phone, f"{reply}\n\n{get_step_reminder(current_flow, flow_state)}"
+    )
 
 
 async def handle_greeting(entities: Dict, phone: str, db: AsyncSession):
@@ -2389,6 +2454,35 @@ async def handle_analytics(phone: str, db: AsyncSession):
 
 
 
+async def handle_balance(entities: Dict, phone: str, db: AsyncSession):
+    """Report sales figures without misrepresenting them as withdrawable funds."""
+    from app.services.analytics import get_organizer_analytics
+
+    result = await db.execute(select(User).where(User.phone == phone))
+    user = result.scalar_one_or_none()
+    if not user:
+        await whatsapp_service.send_message(phone, "I couldn't find your account yet.")
+        return
+
+    analytics = await get_organizer_analytics(str(user.id), db, period='30d')
+    summary = analytics['summary']
+    if summary['total_events'] == 0:
+        await whatsapp_service.send_message(
+            phone,
+            "You don't have a wallet or payout balance recorded yet. Create an event to start tracking sales."
+        )
+        return
+
+    await whatsapp_service.send_message(
+        phone,
+        "Sales summary (last 30 days)\n\n"
+        f"- Confirmed sales: NGN {summary['total_revenue']:,.0f}\n"
+        f"- Tickets sold: {summary['total_tickets']}\n"
+        f"- Bookings: {summary['total_bookings']}\n\n"
+        "This is ticket-sales revenue, not a withdrawable wallet balance. A payout ledger is not connected yet."
+    )
+
+
 async def handle_download_report(phone: str, db: AsyncSession):
     """Handle report download request"""
     from app.services.reports import generate_revenue_report
@@ -3014,10 +3108,6 @@ async def handle_gift_history(command: str, phone: str, db: AsyncSession):
         conversation=None,
         context="gift_history_actions"
     )
-
-
-
-
 
 
 

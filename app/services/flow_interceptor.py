@@ -14,7 +14,7 @@ from typing import Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.whatsapp import whatsapp_service
-from app.services.ai_engine import classify_intent, quick_intent_detection, Intent
+from app.services.ai_engine import AIResponse, Entity, classify_intent, quick_intent_detection, Intent
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,16 @@ _NAVIGATION_COMMANDS = {
     "action:start_registration", "action:menu", "action:cancel_broadcast",
 }
 
+# Requests that must be handled as a separate task, rather than saved as the
+# next form answer. Keep this narrow so a venue such as "Events Centre, Lekki"
+# is still accepted as an address.
+_ACTION_REQUEST_RE = re.compile(
+    r"(?:\b(?:show|find|discover|search|look\s+up|random|upcoming|nearby)\b.*\bevents?\b"
+    r"|\b(?:my\s+)?(?:wallet|balance|earnings|revenue|sales|tickets|bookings)\b"
+    r"|\b(?:create|host|manage)\s+(?:an?\s+)?event\b)",
+    re.IGNORECASE,
+)
+
 
 def should_intercept_flow(message: str, current_flow: str, flow_state: dict) -> bool:
     """
@@ -55,6 +65,9 @@ def should_intercept_flow(message: str, current_flow: str, flow_state: dict) -> 
     # 1. Never intercept explicit navigation or button actions
     if lowered in _NAVIGATION_COMMANDS or cleaned.startswith("action:"):
         return False
+
+    if _ACTION_REQUEST_RE.search(cleaned):
+        return True
         
     step = flow_state.get("step") if isinstance(flow_state, dict) else None
     
@@ -122,8 +135,9 @@ async def handle_flow_intercept(
     user_message: str,
     current_flow: str,
     flow_state: dict,
-    db: AsyncSession
-) -> None:
+    db: AsyncSession,
+    send_response: bool = True,
+):
     """
     Handle a conversational side-question while maintaining the active flow.
     Answers the user's question via AI and appends a step reminder.
@@ -131,12 +145,27 @@ async def handle_flow_intercept(
     logger.info("Flow interceptor triggered during %s (step=%s) for message: '%s'",
                 current_flow, flow_state.get('step'), user_message)
 
-    # Ask AI engine to answer the user's question
-    ai_response = await classify_intent(user_message)
+    # Use deterministic intents first. This keeps essential account/event
+    # requests working even if the LLM provider is temporarily unavailable.
+    fast_intent = quick_intent_detection(user_message)
+    if fast_intent:
+        ai_response = AIResponse(
+            intent=fast_intent,
+            entities=Entity(),
+            confidence=1.0,
+            requires_clarification=False,
+            clarification_question=None,
+            user_message="On it.",
+        )
+    else:
+        ai_response = await classify_intent(user_message)
     reply_text = ai_response.user_message
 
     # Get reminder for active step
     reminder = get_step_reminder(current_flow, flow_state)
 
     combined_response = f"{reply_text}\n\n💡 *Note:* {reminder}"
-    await whatsapp_service.send_message(phone, combined_response)
+    if send_response:
+        await whatsapp_service.send_message(phone, combined_response)
+
+    return ai_response

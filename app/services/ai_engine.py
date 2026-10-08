@@ -46,6 +46,7 @@ class Intent(str, Enum):
     REQUEST_REFUND = "request_refund"
     CREATE_EVENT = "create_event"
     MANAGE_EVENT = "manage_event"
+    VIEW_BALANCE = "view_balance"
     GENERAL_QUERY = "general_query"
     GREETING = "greeting"
     HELP = "help"
@@ -123,6 +124,8 @@ _DISCOVER_PHRASES = {
     "whats happening near me", "anything near me", "events around me",
     "around me", "nearby events", "events nearby", "what events are near me",
     "show events near me", "find events near me", "events close to me",
+    "random events", "show me random events", "show events", "show me events",
+    "upcoming events", "what events are happening",
 }
 
 _VIEW_TICKETS_PHRASES = {
@@ -141,6 +144,8 @@ _HELP_PHRASES = {
     "help", "what can you do", "how does this work", "how to use", "commands",
     "what can you help with", "i need help", "what do you do",
 }
+
+_BALANCE_WORDS = {"wallet", "balance", "earnings", "revenue", "sales"}
 
 # Navigation phrases handled directly by the message router; returning
 # GENERAL_QUERY keeps them off the LLM while letting the router intercept them.
@@ -194,6 +199,11 @@ def quick_intent_detection(message: str) -> Optional[Intent]:
         return Intent.DISCOVER_EVENTS
     if norm in _HELP_PHRASES:
         return Intent.HELP
+    if any(token in _BALANCE_WORDS for token in tokens) and any(
+        token in {"my", "wallet", "balance", "earnings", "revenue", "sales"}
+        for token in tokens
+    ):
+        return Intent.VIEW_BALANCE
 
     # Pidgin / multi-word greetings (after stripping removable filler).
     core = " ".join(t for t in tokens if t not in _REMOVABLE_FILLER)
@@ -236,6 +246,7 @@ INTENTS — classify the user's latest message into exactly ONE of these:
 - request_refund: cancel a booking and get a refund.
 - create_event: the user wants to host/create an event.
 - manage_event: an organizer wants stats, attendees, broadcast or to edit their event.
+- view_balance: an organizer asks for their wallet, balance, earnings, sales or revenue.
 - greeting: a pure greeting or small talk with no request ("hi", "how far", "good morning").
 - help: the user asks what you can do or how to use the service.
 - general_query: anything else, including off-topic or unclear messages.
