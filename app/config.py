@@ -20,7 +20,7 @@ class Settings(BaseSettings):
 
     # AI
     GROQ_API_KEY: str
-    GROQ_MODEL: str = "llama3-70b-8192"
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
     # Classification should be deterministic — keep temperature at 0 unless tuning.
     GROQ_TEMPERATURE: float = 0.0
     GROQ_MAX_TOKENS: int = 700
