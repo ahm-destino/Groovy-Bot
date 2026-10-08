@@ -388,6 +388,15 @@ async def handle_intent(
     # ============ STEP 1: CHECK IF USER IS REGISTERED ============
     # If user doesn't exist OR not fully registered → Go to registration
     if not user or not user.first_name or not user.last_name:
+        if conversation and conversation.current_flow == 'user_registration':
+            from app.services.flow_interceptor import should_intercept_flow, handle_flow_intercept
+            if should_intercept_flow(raw_message, conversation.current_flow, conversation.flow_state or {}):
+                await handle_flow_intercept(phone, raw_message, conversation.current_flow, conversation.flow_state or {}, db)
+                return
+            from app.services.user_registration import UserRegistrationFlow
+            await UserRegistrationFlow.process_step(phone, raw_message, db)
+            return
+
         # Start registration flow
         from app.services.user_registration import UserRegistrationFlow
         conversation.current_flow = 'user_registration'
@@ -398,6 +407,11 @@ async def handle_intent(
     
     # ============ STEP 2: CHECK FOR ACTIVE FLOWS ============
     # If user is in middle of a flow (registration, gift, event creation, etc) → Continue it
+    if conversation and conversation.current_flow in ('user_registration', 'gift_ticket', 'event_creation', 'event_editing'):
+        from app.services.flow_interceptor import should_intercept_flow, handle_flow_intercept
+        if should_intercept_flow(raw_message, conversation.current_flow, conversation.flow_state or {}):
+            await handle_flow_intercept(phone, raw_message, conversation.current_flow, conversation.flow_state or {}, db)
+            return
     
     if conversation.current_flow == 'user_registration':
         # Continue user registration flow
