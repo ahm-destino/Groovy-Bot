@@ -28,6 +28,46 @@ def _split_profile_name(name: str) -> tuple[Optional[str], Optional[str]]:
     return first, last
 
 
+# Phrases that let a user bail out of registration and begin again. Checked as
+# substrings so "i want to start afresh guy" still matches "start afresh".
+_RESTART_COMMANDS = (
+    'cancel', 'restart', 'reset', 'start over', 'start again', 'start afresh',
+    'start fresh', 'start new', 'menu', 'main menu', 'back to menu', 'quit', 'exit',
+)
+
+# Tokens that mean "yes, begin". Checked against the whole message and each word
+# so "ok let's go" and "i want to start" both count. The intro step only advances
+# on one of these (or the button), so we never silently swallow a real message.
+_PROCEED_SIGNALS = {
+    'start', 'begin', 'proceed', 'continue', 'ready', 'yes', 'y', 'yeah', 'yep',
+    'ok', 'okay', 'sure', 'go', 'register', 'signup',
+    'action:start_registration', 'start_registration',
+}
+
+# A real name is mostly letters, is short, and is not a command, greeting or
+# insult — we must never store "Bro" or "Heyy nigga" as a name and echo it back
+# in receipts, tickets and attendee lists.
+_NAME_MAX_LEN = 40
+_NAME_MAX_WORDS = 4
+_NAME_ALLOWED_RE = re.compile(r"^[A-Za-z][A-Za-z '\-.]*$")
+_NAME_BLOCKED_TOKENS = {
+    # commands / navigation
+    'near', 'menu', 'help', 'back', 'cancel', 'discover', 'search', 'book',
+    'ticket', 'tickets', 'event', 'events', 'create', 'gift', 'refund', 'share',
+    'profile', 'account', 'register', 'registration', 'registering', 'start',
+    'stop', 'skip', 'later', 'home', 'restart', 'reset', 'am', 'is', 'are',
+    'want', 'the', 'and', 'you', 'your', 'namaste',
+    # greetings / filler
+    'hi', 'hii', 'hiii', 'hey', 'heyy', 'heyyy', 'hello', 'helo', 'yo', 'sup',
+    'howdy', 'greetings', 'morning', 'afternoon', 'evening', 'bro', 'bros',
+    'boss', 'sir', 'ma', 'madam', 'dear', 'guy', 'guys', 'fam', 'pal', 'man',
+    'abeg', 'pls', 'please', 'thanks', 'thank', 'thanx', 'welcome', 'test',
+    # profanity / slurs
+    'nigga', 'nigger', 'fuck', 'fucking', 'shit', 'bitch', 'ass', 'bastard',
+    'idiot', 'stupid', 'dumb', 'fool', 'nonsense', 'wtf', 'sex', 'porn',
+}
+
+
 class UserRegistrationFlow:
     """Multi-turn flow for user registration"""
 
@@ -100,18 +140,45 @@ class UserRegistrationFlow:
 
         step = conversation.flow_state.get('step')
 
-        if step == 'greeting':
-            # User clicked "Proceed to Registration" button
-            # Move to first step
-            conversation.flow_state['step'] = 'first_name'
+        # Escape hatch: at any step past the intro, a cancel/restart/menu command
+        # restarts registration. Without this a user who mistyped — or who just
+        # wants out — is stuck being re-asked the same question forever.
+        normalized = " ".join((message or "").lower().split())
+        if step != 'greeting' and any(cmd in normalized for cmd in _RESTART_COMMANDS):
+            conversation.flow_state = {'step': 'first_name', 'phone': phone}
             flag_modified(conversation, 'flow_state')
             await db.commit()
-            
-            first_step_message = (
-                "Great! Let's begin.\n\n"
+            await whatsapp_service.send_message(
+                phone,
+                "No wahala — let's start over.\n\n"
                 "Step 1 of 4: What is your first name?"
             )
-            await whatsapp_service.send_message(phone, first_step_message)
+            return
+
+        if step == 'greeting':
+            # Advance only when the user actually signals they're ready (button,
+            # "yes", "ok", "let's start"...). Previously ANY message moved the
+            # flow on, so a user who typed something else silently had it eaten
+            # as the answer to the next step (e.g. "Hey" became their username).
+            tokens = set(normalized.replace(":", " ").split())
+            if tokens & _PROCEED_SIGNALS:
+                conversation.flow_state['step'] = 'first_name'
+                flag_modified(conversation, 'flow_state')
+                await db.commit()
+
+                first_step_message = (
+                    "Great! Let's begin.\n\n"
+                    "Step 1 of 4: What is your first name?"
+                )
+                await whatsapp_service.send_message(phone, first_step_message)
+            else:
+                await whatsapp_service.send_interactive(
+                    phone,
+                    "Ready to get started? Tap below or reply Ok.",
+                    buttons=[
+                        {"id": "action:start_registration", "title": "Proceed to Registration"}
+                    ]
+                )
         elif step == 'first_name':
             await UserRegistrationFlow._handle_first_name(
                 phone, message, conversation, db
@@ -130,6 +197,21 @@ class UserRegistrationFlow:
             )
 
     @staticmethod
+    def _name_error(raw: str, which: str) -> Optional[str]:
+        """Return an error message if `raw` is not a plausible name, else None."""
+        name = (raw or "").strip()
+        if len(name) < 2:
+            return f"❌ That doesn't look like a {which} name. Please use at least 2 letters."
+        if len(name) > _NAME_MAX_LEN or len(name.split()) > _NAME_MAX_WORDS:
+            return f"❌ That's too long for a {which} name. Please send just your {which} name."
+        if not _NAME_ALLOWED_RE.match(name):
+            return f"❌ Please use letters only for your {which} name (no digits or symbols)."
+        tokens = re.split(r"[\s'\-\.]+", name.lower())
+        if any(tok in _NAME_BLOCKED_TOKENS for tok in tokens if tok):
+            return f"❌ That doesn't look like a {which} name. Please send your real {which} name."
+        return None
+
+    @staticmethod
     async def _handle_first_name(
         phone: str,
         message: str,
@@ -137,30 +219,11 @@ class UserRegistrationFlow:
         db: AsyncSession
     ):
         """Handle first name input"""
-        first_name = message.strip()
+        first_name = " ".join(message.split())
 
-        # Reject keywords and commands (exact match only to avoid false positives with names like James or Michelle)
-        blocked_keywords = {'near', 'me', 'hi', 'hello', 'menu', 'help', 'back', 'cancel', 'discover', 'search', 'book', 'ticket', 'my'}
-        if first_name.lower() in blocked_keywords:
-            await whatsapp_service.send_message(
-                phone,
-                "❌ That looks like a command, not a name. Please enter your actual first name."
-            )
-            return
-
-        # Validate name
-        if len(first_name) < 2:
-            await whatsapp_service.send_message(
-                phone,
-                "❌ Invalid. First name must be 2+ characters. Try again."
-            )
-            return
-
-        if not re.search(r'[a-zA-Z]', first_name):
-            await whatsapp_service.send_message(
-                phone,
-                "❌ Invalid. Include at least one letter. Try again."
-            )
+        error = UserRegistrationFlow._name_error(first_name, "first")
+        if error:
+            await whatsapp_service.send_message(phone, error)
             return
 
         # Save and move to next step
@@ -183,30 +246,11 @@ class UserRegistrationFlow:
         db: AsyncSession
     ):
         """Handle last name input"""
-        last_name = message.strip()
+        last_name = " ".join(message.split())
 
-        # Reject keywords and commands (exact match only)
-        blocked_keywords = {'near', 'me', 'hi', 'hello', 'menu', 'help', 'back', 'cancel', 'discover', 'search', 'book', 'ticket', 'my'}
-        if last_name.lower() in blocked_keywords:
-            await whatsapp_service.send_message(
-                phone,
-                "❌ That looks like a command, not a name. Please enter your actual last name."
-            )
-            return
-
-        # Validate name
-        if len(last_name) < 2:
-            await whatsapp_service.send_message(
-                phone,
-                "❌ Invalid. Last name must be 2+ characters. Try again."
-            )
-            return
-
-        if not re.search(r'[a-zA-Z]', last_name):
-            await whatsapp_service.send_message(
-                phone,
-                "❌ Invalid. Include at least one letter. Try again."
-            )
+        error = UserRegistrationFlow._name_error(last_name, "last")
+        if error:
+            await whatsapp_service.send_message(phone, error)
             return
 
         # Save and move to email
@@ -238,7 +282,8 @@ class UserRegistrationFlow:
         if not re.match(email_pattern, email_input):
             await whatsapp_service.send_message(
                 phone,
-                "❌ Invalid email format. Please send a valid email address."
+                "❌ Invalid email format. Please send a valid email address.\n\n"
+                "Type menu if you'd like to start over."
             )
             return
 
@@ -346,7 +391,9 @@ class UserRegistrationFlow:
         if not message or message.strip().lower() in ['skip', 'later', 'no']:
             await whatsapp_service.send_message(
                 phone,
-                "❌ Location is required. Please share your current location.\n\nTap + or attachment icon > Location > Send current location."
+                "❌ Location is required. Please share your current location.\n\n"
+                "Tap + or attachment icon > Location > Send current location.\n\n"
+                "Type menu if you'd like to start over."
             )
             return
         # Save location (for now, just store the message; in production, parse/validate coordinates)
